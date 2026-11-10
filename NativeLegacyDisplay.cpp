@@ -225,11 +225,11 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
                                            {0x24000,1u<<11},{0x26000,1u<<12},{0x28000,1u<<24},{0x2a000,1u<<25}};
     uint32_t directVig[8]={},directPipes=0,directFlush=0,bootIova=0,bootStride=0;
     void startDirect() {
-        unsigned mode=0;PE_parse_boot_argn("sheng-dpu-scanout",&mode,sizeof(mode));
-        PE_parse_boot_argn("sheng-dpu-probe",&probeOn,sizeof(probeOn));
-        PE_parse_boot_argn("sheng-dpu-flipdelay",&flipDelayUs,sizeof(flipDelayUs));if(flipDelayUs>50000)flipDelayUs=50000;
-        PE_parse_boot_argn("sheng-dpu-gpuwait",&gpuWait,sizeof(gpuWait));
-        PE_parse_boot_argn("sheng-dpu-early-done",&earlyDone,sizeof(earlyDone));
+        unsigned mode=0;PE_parse_boot_argn("dpu-scanout",&mode,sizeof(mode));
+        PE_parse_boot_argn("dpu-probe",&probeOn,sizeof(probeOn));
+        PE_parse_boot_argn("dpu-flipdelay",&flipDelayUs,sizeof(flipDelayUs));if(flipDelayUs>50000)flipDelayUs=50000;
+        PE_parse_boot_argn("dpu-gpuwait",&gpuWait,sizeof(gpuWait));
+        PE_parse_boot_argn("dpu-early-done",&earlyDone,sizeof(earlyDone));
         getDisplayDimensions(&probeWidth,&probeHeight);
         if(mode<2 || !&native_ufs_dpu_map || !&native_ufs_dpu_state || !primary)return;
         // NativeUfs watches the bank's first fetches for 50 ms before it reports, and the display may start inside that window (T40k: the
@@ -254,7 +254,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         mdp=reinterpret_cast<volatile uint32_t *>(mdpMap->getVirtualAddress());
         PE_Video video={};
         const uint64_t boot=bootMapping?bootMapping->getPhysicalAddress():0;
-        uint32_t want=0x3;PE_parse_boot_argn("sheng-dpu-flush",&want,sizeof(want));
+        uint32_t want=0x3;PE_parse_boot_argn("dpu-flush",&want,sizeof(want));
         native_legacy_direct[11]=mdp[(0x4000+0x14)/4];
         if(!PE_current_console(&video) && boot && boot<=0xffffffffull && video.v_baseAddr==boot) {
             bootIova=uint32_t(boot);bootStride=uint32_t(video.v_rowBytes);
@@ -410,7 +410,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         vsyncArmed=true;vsyncTimer->wakeAtTime(vsyncNext);
     }
     void startVsync() {
-        unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
+        unsigned hz=0;PE_parse_boot_argn("vsync",&hz,sizeof(hz));
         if(!hz || hz>240 || !primary || !bootMapping || vsyncTimer)return;
         IOWorkLoop *loop=getWorkLoop();
         if(!loop)return;
@@ -502,7 +502,7 @@ public:
         if(enabled!=1)native_legacy_backend_guard(84,this,__builtin_return_address(0));
         // Nothing in the family publishes IOMFBDisplayRefresh (its platform subclass does), and without it the render server keeps its own
         // 1/60 s heartbeat (int-210: refresh=0). Publish it before any client can find the display, only when sheng-vsync asks for more.
-        unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
+        unsigned hz=0;PE_parse_boot_argn("vsync",&hz,sizeof(hz));
         if(primary && hz>60 && hz<=240)native_legacy_set_refresh_properties(this);
         IOService::registerService(options);native_legacy_registration_observed(this);
     }
@@ -514,9 +514,9 @@ public:
     // variable refresh, so sheng-vsync-fixed=1 reports the maximum interval equal to the minimum: one fixed rate.
     bool getRefreshAttributes(uint64_t *words,bool fixed) override {
         if(!IOMobileFramebufferLegacy::getRefreshAttributes(words,fixed) || !words)return false;
-        unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
+        unsigned hz=0;PE_parse_boot_argn("vsync",&hz,sizeof(hz));
         if(hz<=60 || hz>240)return true;
-        unsigned locked=0;PE_parse_boot_argn("sheng-vsync-fixed",&locked,sizeof(locked));
+        unsigned locked=0;PE_parse_boot_argn("vsync-fixed",&locked,sizeof(locked));
         const uint64_t interval=(1ull<<32)/hz;
         uint64_t machTime=0;nanoseconds_to_absolutetime(interval*1000000000ull>>32,&machTime);
         words[0]=interval;words[1]=machTime;
@@ -627,7 +627,7 @@ public:
             // copy (int-243: about 4.4 ms render then about 3 ms copy per frame). Retire now: the presenter holds its own reference to this
             // frame's memory, the previous frame's copy has finished (transferred held this one back), and the next swap still waits for
             // the copy because transferred stays set until finishGpuSwap.
-            unsigned early=1;PE_parse_boot_argn("sheng-early-retire",&early,sizeof(early));
+            unsigned early=1;PE_parse_boot_argn("early-retire",&early,sizeof(early));
             if(early==1 && retireSwap(request,true)) {
                 gpuRetired=true;native_legacy_early_retires=native_legacy_early_retires+1;
             }
@@ -664,7 +664,7 @@ public:
             // than the plain copy (143-285 ms per swap either way), and the first boots with it were followed by an unresponsive
             // lock screen that disappeared with the plain copy (int-005).
             static int diffOff=-1;
-            if(diffOff<0){unsigned v=0;PE_parse_boot_argn("sheng-fb-diff",&v,sizeof v);diffOff=(v!=1);}
+            if(diffOff<0){unsigned v=0;PE_parse_boot_argn("fb-diff",&v,sizeof v);diffOff=(v!=1);}
             if(!diffOff && !shadow && need<=(64ull<<20)){shadow=IOMallocAligned((vm_size_t)need,16384);if(shadow){shadowBytes=need;shadowValid=false;}}
             if(!diffOff && shadow && shadowBytes>=need)
                 stored=native_legacy_copy_diff(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
