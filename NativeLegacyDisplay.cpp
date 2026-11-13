@@ -300,10 +300,22 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     bool fenceCaptured=false,fenceSlow=false;
     IOTimerEventSource *fenceTimer=nullptr;
     bool directOn=false,directBoot=true;
-    static constexpr uint32_t kVig[2]={0x4000,0x6000},kCtlFlush=0x15018,kBootIova=0xb8000000U,kBootStride=0x2fa0;
+    static constexpr uint32_t kCtlFlush=0x15018;
+    // asteroids: the pipes a board names (dpu-flush: their CTL flush bits, default 0x3 = VIG 0 and 1 as on sheng), each used only if it scans
+    // out the boot memory now (its source address 0 equals the GOP's), so a wrong mask keeps the copy. The boot memory and its stride are the
+    // GOP's: sheng 0xb8000000 and 0x2fa0, the Nothing Phone (3a) 0xe3940000 and 4320 through VIG 0 alone (dpu-flush=1).
+    struct DirectPipe {uint32_t offset,bit;};
+    static constexpr DirectPipe kPipes[8]={{0x4000,1u<<0},{0x6000,1u<<1},{0x8000,1u<<2},{0xa000,1u<<18},
+                                           {0x24000,1u<<11},{0x26000,1u<<12},{0x28000,1u<<24},{0x2a000,1u<<25}};
+    uint32_t directVig[8]={},directPipes=0,directFlush=0,bootIova=0,bootStride=0;
     void startDirect() {
         unsigned mode=0;PE_parse_boot_argn("dpu-scanout",&mode,sizeof(mode));
-        if(mode<2 || !&native_ufs_dpu_map || !&native_ufs_dpu_state || !(native_ufs_dpu_state>>31) || !primary)return;
+        if(mode<2 || !&native_ufs_dpu_map || !&native_ufs_dpu_state || !primary)return;
+        // asteroids: NativeUfs watches the bank's first fetches for 50 ms before it reports, and the display may start inside that window: wait
+        // for it, up to 500 ms. 0xdead000n is a refusal, not a bank.
+        for(unsigned waited=0;!native_ufs_dpu_state && waited<500;waited+=5)IOSleep(5);
+        const uint32_t state=native_ufs_dpu_state;
+        if(!(state>>31) || (state>>16)==0xdead)return;
         IODeviceMemory *memory=IODeviceMemory::withRange(0xae01000,0x8f000);
         mdpMap=memory?memory->map(kIOMapAnywhere|kIOMapInhibitCache):nullptr;
         if(memory)memory->release();
@@ -317,6 +329,22 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
             return;
         }
         mdp=reinterpret_cast<volatile uint32_t *>(mdpMap->getVirtualAddress());
+        PE_Video video={};
+        const uint64_t boot=bootMapping?bootMapping->getPhysicalAddress():0;
+        uint32_t want=0x3;PE_parse_boot_argn("dpu-flush",&want,sizeof(want));
+        if(!PE_current_console(&video) && boot && boot<=0xffffffffull && video.v_baseAddr==boot) {
+            bootIova=uint32_t(boot);bootStride=uint32_t(video.v_rowBytes);
+            for(const DirectPipe &pipe:kPipes)
+                if((want&pipe.bit) && mdp[(pipe.offset+0x14)/4]==bootIova){directVig[directPipes++]=pipe.offset;directFlush|=pipe.bit;}
+        }
+        IOLog("NativeLegacyDisplay: direct scanout pipes %u flush %x of %x, boot %x stride %u\n",directPipes,directFlush,want,bootIova,bootStride);
+        if(!directPipes || directFlush!=want) {   /* a named pipe that does not scan out the boot memory: keep the copy */
+            OSSafeReleaseNULL(mdpMap);mdp=nullptr;
+            if(IOWorkLoop *l=getWorkLoop()){l->removeEventSource(fenceTimer);l->removeEventSource(latchTimer);}
+            OSSafeReleaseNULL(latchTimer);OSSafeReleaseNULL(fenceTimer);
+            IOFreeData(directPages,8192*sizeof(uint64_t));directPages=nullptr;
+            return;
+        }
         directOn=true;gDirectDisplay=this;
     }
     // The diagnostic screenshot reads the boot memory, which the display no longer scans: draw the surface on screen into it (rows of the
@@ -333,9 +361,9 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     }
     void flip(uint32_t iova,uint32_t stride) {
         shownStride=stride;
-        for(uint32_t vig:kVig){mdp[(vig+0x14)/4]=iova;mdp[(vig+0x24)/4]=stride&0xffff;}
+        for(uint32_t i=0;i<directPipes;++i){mdp[(directVig[i]+0x14)/4]=iova;mdp[(directVig[i]+0x24)/4]=stride&0xffff;}
         __asm__ volatile("dsb sy" ::: "memory");
-        mdp[kCtlFlush/4]=0x3;
+        mdp[kCtlFlush/4]=directFlush;
         __asm__ volatile("dsb sy" ::: "memory");
     }
     // The slot that holds this surface, mapping it into a free one (never the one on screen or the one waiting to latch) the first time.
@@ -418,7 +446,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         if(!latchRequest)return;
         uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-latchStart,&ns);
         gpuTraceEvent(GpuTraceDisplayLatch,0,traceId(latchRequest),mdp[kCtlFlush/4],ns,shownSlot,pendingSlot);
-        if((mdp[kCtlFlush/4]&0x3) && ns<50000000ull){latchTimer->setTimeoutUS(500);return;}
+        if((mdp[kCtlFlush/4]&directFlush) && ns<50000000ull){latchTimer->setTimeoutUS(500);return;}
         if(ns>=50000000ull)native_legacy_direct[3]=native_legacy_direct[3]+1;
         const uint32_t us=uint32_t(ns/1000);
         if(us>native_legacy_direct[4])native_legacy_direct[4]=us;
@@ -431,7 +459,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     // Back to the boot loader's memory (the blank frame and the copy are drawn there).
     void directToBoot() {
         if(!directOn || directBoot)return;
-        flip(kBootIova,kBootStride);directBoot=true;shownSlot=-1;
+        flip(bootIova,bootStride);directBoot=true;shownSlot=-1;
         native_legacy_direct[8]=native_legacy_direct[8]+1;
     }
     bool vsyncWanted() const {
